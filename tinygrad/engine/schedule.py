@@ -257,7 +257,7 @@ def _append_store(stores:Dict[UOp, UOp], b:UOp, store:UOp) -> None:
   stores[b] = store
   return None
 append_stores = PatternMatcher([
-  (UPat.load(UPat.var("b"), UPat(), UPat.store(UPat.var("b"), UPat(), UPat(), name="store")), _append_store),
+  (UPat.load(UPat.var("b"), UPat(), UPat(UOps.STORE, src=(UPat.var("b"), UPat(), UPat()), name="store")), _append_store),
 ])
 
 def _append_assign(assign_preloads:Dict[UOp, Optional[UOp]], root:UOp, b:UOp) -> None:
