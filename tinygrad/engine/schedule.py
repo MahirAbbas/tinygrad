@@ -262,7 +262,7 @@ append_stores = PatternMatcher([
 
 def _append_assign(assign_preloads:Dict[UOp, Optional[UOp]], root:UOp, b:UOp) -> None:
   if b in assign_preloads:
-    assert (dup:=assign_preloads[b]) is None, f"got multiple preloads for {b} {dup} {root}"
+    assert assign_preloads[b] is None, f"got multiple preloads for {b} {assign_preloads[b]} {root}"
     assign_preloads[b] = root
   return None
 append_preloads = PatternMatcher([
@@ -371,8 +371,10 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
       uop = UOp(UOps.VALID, dtypes.bool, (buf.st.to_uop(),)).where(v:=UOp.const(buf.dtype.scalar(), buf.arg), v.const_like(0))
     # NOTE: UOps.BUFFER creation must come after the ImageDType fixup
     else: uop = UOp(UOps.BUFFER, buf.buffer.dtype.ptr(), (), (len(buf_uops), (buf.buffer.device, buf.buffer.size, buf.buffer.dtype)))
-    uop_bufs.setdefault(buf_uops.setdefault(buf.buffer, uop), buf.buffer)
-    if buf.realized is None and buf.op is not MetaOps.CONST: output_groups[reduce_for_op.get(buf, buf)].append(uop)
+    if buf.buffer not in buf_uops:
+      buf_uops[buf.buffer] = uop
+      uop_bufs[uop] = buf.buffer
+    if buf.realized is None and buf.op is not MetaOps.CONST: output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
     if buf.op is MetaOps.ASSIGN: assign_preloads[uop] = None
 
   metadata: Dict[UOp, Metadata] = {}
