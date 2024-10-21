@@ -132,9 +132,17 @@ to_ast = PatternMatcher([
   (UPat(UOps.SINK, src=(UPat.store(UPat(), UPat(), UPat(tuple(METAOPS.values()), name="x")),)), lambda x: x),
 ])
 
+def _do_replace(outputs:Tuple[UOp, ...], st:UOp, b:UOp, val:UOp) -> UOp:
+  return val if b in outputs else UOp(UOps.LOAD, val.dtype, (b, st))
+replace_load_stores = PatternMatcher([
+  (UPat.load(UPat.var("b"), UPat.var("st"), UPat.store(UPat.var("b"), UPat(), UPat.var("val"))), _do_replace),
+])
+
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
 def full_ast_rewrite(base_sink:UOp, bufs:List[UOp], var_vals:Dict[Variable, int]) -> UOp:
-  sink = graph_rewrite(graph_rewrite(base_sink, view_left), view_right)
+  outputs = tuple(x.src[0] for x in base_sink.src)
+  sink = graph_rewrite(base_sink, replace_load_stores, outputs)
+  sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
   ret = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
   PROCESS_REPLAY_CAPTURE.append((base_sink, ret))
   return ret
@@ -245,11 +253,20 @@ def _get_isolated_children(r:LazyBuffer, reduce_for_op:Dict[LazyBuffer, LazyBuff
   for tr in group: _recursive_group(tr, tr.st, tr, children, realizes, reduce_for_op, descendants, cache={})
   return merge_dicts([group, {} if any(tr in group for tr in descendants) else descendants])
 
-def _append_store(stores:Dict[UOp, UOp], root:UOp, st:UOp, b:UOp, store:UOp) -> UOp:
+def _append_store(stores:Dict[UOp, UOp], b:UOp, store:UOp) -> None:
   stores[b] = store
-  return UOp(UOps.LOAD, root.dtype, (b, st))
+  return None
 append_stores = PatternMatcher([
-  (UPat.load(UPat.var("b"), UPat.var("st"), UPat.store(UPat.var("b"), UPat(), UPat(), name="store"), name="root"), _append_store),
+  (UPat.load(UPat.var("b"), UPat(), UPat.store(UPat.var("b"), UPat(), UPat(), name="store")), _append_store),
+])
+
+def _append_assign(assign_preloads:Dict[UOp, Optional[UOp]], root:UOp, b:UOp) -> None:
+  if b in assign_preloads:
+    assert (dup:=assign_preloads[b]) is None, f"got multiple preloads for {b} {dup} {root}"
+    assign_preloads[b] = root
+  return None
+append_preloads = PatternMatcher([
+  (UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), name="root"), _append_assign),
 ])
 
 @track_rewrites(named=True)
@@ -332,6 +349,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   uop_bufs: Dict[UOp, Buffer] = {}
   var_vals: Dict[Variable, int] = {}
   lazybufs_to_realize: Dict[Buffer, LazyBuffer] = {}
+  assign_preloads: Dict[UOp, Optional[UOp]] = {}
   for buf in realizes:
     if buf.realized is None and buf.op is not MetaOps.CONST:
       if (dup:=lazybufs_to_realize.get(buf.buffer)) is not None:
@@ -355,18 +373,20 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
     else: uop = UOp(UOps.BUFFER, buf.buffer.dtype.ptr(), (), (len(buf_uops), (buf.buffer.device, buf.buffer.size, buf.buffer.dtype)))
     uop_bufs.setdefault(buf_uops.setdefault(buf.buffer, uop), buf.buffer)
     if buf.realized is None and buf.op is not MetaOps.CONST: output_groups[reduce_for_op.get(buf, buf)].append(uop)
+    if buf.op is MetaOps.ASSIGN: assign_preloads[uop] = None
 
   metadata: Dict[UOp, Metadata] = {}
   cache: Dict[LazyBuffer, UOp] = {}
   sink = UOp(UOps.SINK, dtypes.void, tuple(to_uop(x, buf_uops, metadata, cache) for x in outs))
   stores: Dict[UOp, UOp] = {}
   graph_rewrite(sink, append_stores, stores)
+  if len(assign_preloads) != 0: graph_rewrite(sink, append_preloads, assign_preloads)
   # preschedule all buffers in realizes
   prescheduled: List[ScheduleItem] = []
   for outbufs in output_groups.values():
     sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
     bufs: List[UOp] = []
-    prescheduled.append(ScheduleItem(full_ast_rewrite(sink, bufs, var_vals), tuple(uop_bufs[b] for b in bufs), ()))
+    prescheduled.append(si:=ScheduleItem(full_ast_rewrite(sink, bufs, var_vals), tuple(uop_bufs[b] for b in bufs), ()))
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
 
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
