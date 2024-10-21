@@ -133,7 +133,7 @@ to_ast = PatternMatcher([
 ])
 
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
-def full_ast_rewrite(base_sink:UOp, bufs:Tuple[UOp], var_vals:Dict[Variable, int]) -> UOp:
+def full_ast_rewrite(base_sink:UOp, bufs:List[UOp], var_vals:Dict[Variable, int]) -> UOp:
   sink = graph_rewrite(graph_rewrite(base_sink, view_left), view_right)
   ret = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
   PROCESS_REPLAY_CAPTURE.append((base_sink, ret))
@@ -245,6 +245,13 @@ def _get_isolated_children(r:LazyBuffer, reduce_for_op:Dict[LazyBuffer, LazyBuff
   for tr in group: _recursive_group(tr, tr.st, tr, children, realizes, reduce_for_op, descendants, cache={})
   return merge_dicts([group, {} if any(tr in group for tr in descendants) else descendants])
 
+def _append_store(stores:Dict[UOp, UOp], root:UOp, st:UOp, b:UOp, store:UOp) -> UOp:
+  stores[b] = store
+  return UOp(UOps.LOAD, root.dtype, (b, st))
+append_stores = PatternMatcher([
+  (UPat.load(UPat.var("b"), UPat.var("st"), UPat.store(UPat.var("b"), UPat(), UPat(), name="store"), name="root"), _append_store),
+])
+
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:
   """create a graph for realizing the outputs"""
@@ -320,13 +327,13 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
     if DEBUG_ARANGE: print(colored(f"folding {r}", "green"))
     for tr in group: del realizes[tr]
 
-  output_groups: DefaultDict[LazyBuffer, List[LazyBuffer]] = defaultdict(list)
+  output_groups: DefaultDict[LazyBuffer, List[UOp]] = defaultdict(list)
   buf_uops: Dict[Buffer, UOp] = {}
+  uop_bufs: Dict[UOp, Buffer] = {}
   var_vals: Dict[Variable, int] = {}
   lazybufs_to_realize: Dict[Buffer, LazyBuffer] = {}
   for buf in realizes:
     if buf.realized is None and buf.op is not MetaOps.CONST:
-      output_groups[reduce_for_op.get(buf, buf)].append(buf)
       if (dup:=lazybufs_to_realize.get(buf.buffer)) is not None:
         raise RuntimeError(f"can't double realize in one schedule, Buffer is realizing both {dup} and {buf}")
       lazybufs_to_realize[buf.buffer] = buf
@@ -346,7 +353,8 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
       uop = UOp(UOps.VALID, dtypes.bool, (buf.st.to_uop(),)).where(v:=UOp.const(buf.dtype.scalar(), buf.arg), v.const_like(0))
     # NOTE: UOps.BUFFER creation must come after the ImageDType fixup
     else: uop = UOp(UOps.BUFFER, buf.buffer.dtype.ptr(), (), (len(buf_uops), (buf.buffer.device, buf.buffer.size, buf.buffer.dtype)))
-    buf_uops.setdefault(buf.buffer, uop)
+    uop_bufs.setdefault(buf_uops.setdefault(buf.buffer, uop), buf.buffer)
+    if buf.realized is None and buf.op is not MetaOps.CONST: output_groups[reduce_for_op.get(buf, buf)].append(uop)
 
   metadata: Dict[UOp, Metadata] = {}
   cache: Dict[LazyBuffer, UOp] = {}
@@ -354,7 +362,11 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   stores: Dict[UOp, UOp] = {}
   graph_rewrite(sink, append_stores, stores)
   # preschedule all buffers in realizes
-  prescheduled = [_lower_lazybuffer(outs, buf_uops, var_vals) for outs in output_groups.values()]
+  prescheduled: List[ScheduleItem] = []
+  for outbufs in output_groups.values():
+    sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
+    bufs: List[UOp] = []
+    prescheduled.append(ScheduleItem(full_ast_rewrite(sink, bufs, var_vals), tuple(uop_bufs[b] for b in bufs), ()))
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
 
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
