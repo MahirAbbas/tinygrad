@@ -271,7 +271,7 @@ append_stores = PatternMatcher([
   (UPat.load(UPat.var("b"), UPat.var("st"), UPat(UOps.STORE, src=(UPat.var("b"), UPat(), UPat.var("val")), name="store")), _append_store),
 ])
 
-schedule_cache: Dict[UOp, Tuple[Tuple[UOp, ...], Tuple[Tuple[int, ...], ...]]] = {}
+schedule_cache: Dict[UOp, List[Tuple[UOp, ScheduleItemContext]]] = {}
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:
   """create a graph for realizing the outputs"""
@@ -387,18 +387,23 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   big_graph = UOp(UOps.SINK, dtypes.void, tuple(to_uop(x, buf_uops, metadata, cache) for x in outs))
   stores: Dict[UOp, UOp] = {}
   graph_rewrite(big_graph, append_stores, stores)
-  # break the big graph into ScheduleItems
+  # break the big graph into small graphs
+  if (small_graphs:=schedule_cache.get(big_graph)) is None:
+    schedule_cache[big_graph] = small_graphs = []
+    for outbufs in output_groups.values():
+      sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
+      ctx = ScheduleItemContext(var_vals, set(), [], [], {x.src[0]:x.src[2] for x in sink.src}, assigned_to)
+      # rewrite loads
+      sink = graph_rewrite(sink, append_loads, ctx)
+      # swizzle
+      sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
+      # append bufs and var_vals
+      sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, ctx)
+      small_graphs.append((sink, ctx))
+
   prescheduled: List[ScheduleItem] = []
   assign_preloads: List[List[UOp]] = []
-  for outbufs in output_groups.values():
-    sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
-    ctx = ScheduleItemContext(var_vals, set(), [], [], {x.src[0]:x.src[2] for x in sink.src}, assigned_to)
-    # rewrite loads
-    sink = graph_rewrite(sink, append_loads, ctx)
-    # swizzle
-    sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
-    # append bufs and var_vals
-    sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, ctx)
+  for sink,ctx in small_graphs:
     prescheduled.append(si:=ScheduleItem(sink, tuple(uop_bufs[b] for b in ctx.bufs), ()))
     assign_preloads.append(ctx.preloads)
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
