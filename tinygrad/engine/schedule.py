@@ -142,18 +142,17 @@ def _append_buf(ctx:ScheduleItemContext, x:UOp) -> UOp:
   return UOp(UOps.DEFINE_GLOBAL, x.dtype, (), len(ctx.bufs)-1)
 append_bufs = PatternMatcher([(UPat(UOps.BUFFER, name="x"), _append_buf),])
 
-def _append_preload(ctx:ScheduleItemContext, b:UOp) -> None:
-  if b in ctx.assigned_to and b not in ctx.outputs: ctx.preloads.append(b)
-  return None
-append_preloads = PatternMatcher([(UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), arg=True), _append_preload),])
+def _append_loads(ctx:ScheduleItemContext, root:UOp, b:UOp) -> Optional[UOp]:
+  if root.arg is None: return None
+  # add assign preloads
+  if root.arg and b in ctx.assigned_to and b not in ctx.outputs: ctx.preloads.append(b)
+  # fuse multi output store -> loads
+  return fused if not root.arg and (fused:=ctx.outputs.get(b)) is not None else root.replace(arg=None)
+append_loads = PatternMatcher([(UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), name="root"), _append_loads),])
 
 to_ast = PatternMatcher([
   (UPat(UOps.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(UOps.SINK, src=(UPat.store(UPat(), UPat(), UPat(tuple(METAOPS.values()), name="x")),)), lambda x: x),
-])
-
-fuse_multioutput = PatternMatcher([
-  (UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), arg=False), lambda ctx,b: ctx.outputs.get(b, None)),
 ])
 
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
@@ -395,12 +394,10 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   for outbufs in output_groups.values():
     sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
     ctx = ScheduleItemContext(var_vals, set(), [], [], {x.src[0]:x.src[2] for x in sink.src}, assigned_to)
-    # fuse multi output store -> loads
-    if len(ctx.outputs) > 1: sink = graph_rewrite(sink, fuse_multioutput, ctx)
-    # swizzling
+    # rewrite loads
+    sink = graph_rewrite(sink, append_loads, ctx)
+    # swizzle
     sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
-    # add assign preloads in this schedule
-    if len(ctx.assigned_to) != 0: sink = graph_rewrite(sink, append_preloads, ctx)
     # append bufs and var_vals
     sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, ctx)
     prescheduled.append(si:=ScheduleItem(sink, tuple(uop_bufs[b] for b in ctx.bufs), ()))
