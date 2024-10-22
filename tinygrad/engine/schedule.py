@@ -132,21 +132,15 @@ to_ast = PatternMatcher([
   (UPat(UOps.SINK, src=(UPat.store(UPat(), UPat(), UPat(tuple(METAOPS.values()), name="x")),)), lambda x: x),
 ])
 
-def _do_replace(outputs:Tuple[UOp, ...], st:UOp, b:UOp, val:UOp) -> UOp:
+def _do_replace(ctx:Tuple[Tuple[UOp, ...], Dict[UOp, Optional[UOp]]], st:UOp, b:UOp, val:UOp) -> UOp:
+  outputs, assign_preloads = ctx
+  if val.op is UOps.ASSIGN: assign_preloads[b] = None
   return val if b in outputs else UOp(UOps.LOAD, val.dtype, (b, st))
 replace_load_stores = PatternMatcher([
   (UPat.load(UPat.var("b"), UPat.var("st"), UPat.store(UPat.var("b"), UPat(), UPat.var("val"))), _do_replace),
 ])
 
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
-def full_ast_rewrite(base_sink:UOp, bufs:List[UOp], var_vals:Dict[Variable, int]) -> UOp:
-  outputs = tuple(x.src[0] for x in base_sink.src)
-  sink = graph_rewrite(base_sink, replace_load_stores, outputs)
-  sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
-  ret = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
-  PROCESS_REPLAY_CAPTURE.append((base_sink, ret))
-  return ret
-
 if getenv("RUN_PROCESS_REPLAY"):
   @atexit.register
   def save_process_replay():
@@ -385,28 +379,31 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   if len(assign_preloads) != 0: graph_rewrite(sink, append_preloads, assign_preloads)
   # preschedule all buffers in realizes
   prescheduled: List[ScheduleItem] = []
+  preloads: List[List[UOp]] = []
   for outbufs in output_groups.values():
     sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
+    sink = graph_rewrite(sink, replace_load_stores, (tuple(x.src[0] for x in sink.src), si_preloads:=assign_preloads.copy()))
+    preloads.append([k for k,v in si_preloads.items() if v is not None and v in sink.sparents])
+    sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
     bufs: List[UOp] = []
-    prescheduled.append(si:=ScheduleItem(full_ast_rewrite(sink, bufs, var_vals), tuple(uop_bufs[b] for b in bufs), ()))
+    sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
+    prescheduled.append(si:=ScheduleItem(sink, tuple(uop_bufs[b] for b in bufs), ()))
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
 
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
   in_degree: DefaultDict[ScheduleItem, int] = defaultdict(int)
-  for lsi in prescheduled:
+  for i,lsi in enumerate(prescheduled):
     if lsi not in in_degree: in_degree[lsi] = 0
-    # realize outputs after all parents are realized
-    scheduled_parents = dedup(schedule_targets[x] for x in lsi.inputs if x in schedule_targets)
-    for x in scheduled_parents:
-      graph[x].append(lsi)
-      in_degree[lsi] += 1
-    """
     # realize outputs before a parent is assigned to
-    parents_assigns = dedup(schedule_targets[assign_targets[x]] for x in lsi.inputs if x in assign_targets)
+    parents_assigns = dedup(schedule_targets[uop_bufs[x]] for x in preloads[i])
     for assign in parents_assigns:
       graph[lsi].append(assign)
       in_degree[assign] += 1
-    """
+    # realize outputs after all parents are realized
+    scheduled_parents = dedup(xsi for x in lsi.inputs if (xsi:=schedule_targets.get(x)) is not None and xsi not in parents_assigns)
+    for x in scheduled_parents:
+      graph[x].append(lsi)
+      in_degree[lsi] += 1
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
