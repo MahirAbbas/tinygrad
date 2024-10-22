@@ -118,18 +118,34 @@ view_right = merge_views+PatternMatcher([
   (UPat(UOps.REDUCE_AXIS, src=(UPat(UOps.REDUCE_AXIS, name="first_reduce"),), name="root"), merge_double_reduce),
 ])
 
-def _append_st_vars(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], List[UOp]], x:UOp) -> Optional[UOp]:
-  if (st:=unwrap(x.st)) in ctx[1]: return None
+# ** ScheduleItem context builder
+
+@dataclass(frozen=True)
+class ScheduleItemContext:
+  var_vals: Dict[Variable, int]
+  sts: Set[ShapeTracker]
+  bufs: List[UOp]
+  preloads: List[UOp]
+  outputs: Dict[UOp, UOp]
+  assigned_to: Set[UOp]
+
+def _append_st_vars(ctx:ScheduleItemContext, x:UOp) -> Optional[UOp]:
+  if (st:=unwrap(x.st)) in ctx.sts: return None
   st, var_vals = st.simplify().unbind()
-  ctx[0].update(var_vals)
-  ctx[1].add(st)
+  ctx.var_vals.update(var_vals)
+  ctx.sts.add(st)
   return st.to_uop() if st != x.st else None
 append_st_vars = PatternMatcher([(UPat(UOps.VIEW, name="x"), _append_st_vars)])
 
-def _append_buf(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], List[UOp]], x:UOp) -> UOp:
-  ctx[2].append(x)
-  return UOp(UOps.DEFINE_GLOBAL, x.dtype, (), len(ctx[2])-1)
+def _append_buf(ctx:ScheduleItemContext, x:UOp) -> UOp:
+  ctx.bufs.append(x)
+  return UOp(UOps.DEFINE_GLOBAL, x.dtype, (), len(ctx.bufs)-1)
 append_bufs = PatternMatcher([(UPat(UOps.BUFFER, name="x"), _append_buf),])
+
+def _append_preload(ctx:ScheduleItemContext, b:UOp) -> None:
+  if b in ctx.assigned_to and b not in ctx.outputs: ctx.preloads.append(b)
+  return None
+append_preloads = PatternMatcher([(UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), arg=True), _append_preload),])
 
 to_ast = PatternMatcher([
   (UPat(UOps.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
@@ -137,7 +153,7 @@ to_ast = PatternMatcher([
 ])
 
 fuse_multioutput = PatternMatcher([
-  (UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), arg=False), lambda outputs,b: outputs.get(b, None)),
+  (UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), arg=False), lambda ctx,b: ctx.outputs.get(b, None)),
 ])
 
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
@@ -375,19 +391,20 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   graph_rewrite(sink, append_stores, stores)
   # break the big graph into ScheduleItems
   prescheduled: List[ScheduleItem] = []
-  preloads: List[List[UOp]] = []
+  assign_preloads: List[List[UOp]] = []
   for outbufs in output_groups.values():
     sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
+    ctx = ScheduleItemContext(var_vals, set(), [], [], {x.src[0]:x.src[2] for x in sink.src}, assigned_to)
     # fuse multi output store -> loads
-    if len(outputs:={x.src[0]:x.src[2] for x in sink.src}) > 1: sink = graph_rewrite(sink, fuse_multioutput, outputs)
-    # add assign preloads
-    preloads.append([b for x in sink.parents if x.op is UOps.LOAD and x.arg and (b:=x.src[0]) in assigned_to and b not in outputs] if len(assigned_to) != 0 else [])
+    if len(ctx.outputs) > 1: sink = graph_rewrite(sink, fuse_multioutput, ctx)
     # swizzling
     sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
-    # append buffers and var_vals
-    bufs: List[UOp] = []
-    sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
-    prescheduled.append(si:=ScheduleItem(sink, tuple(uop_bufs[b] for b in bufs), ()))
+    # add assign preloads in this schedule
+    if len(ctx.assigned_to) != 0: sink = graph_rewrite(sink, append_preloads, ctx)
+    # append bufs and var_vals
+    sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, ctx)
+    prescheduled.append(si:=ScheduleItem(sink, tuple(uop_bufs[b] for b in ctx.bufs), ()))
+    assign_preloads.append(ctx.preloads)
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
 
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
@@ -395,7 +412,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   for i,lsi in enumerate(prescheduled):
     if lsi not in in_degree: in_degree[lsi] = 0
     # realize outputs before a parent is assigned to
-    parents_assigns = dedup(xsi for x in preloads[i] if (xsi:=schedule_targets.get(uop_bufs[x])))
+    parents_assigns = dedup(xsi for x in assign_preloads[i] if (xsi:=schedule_targets.get(uop_bufs[x])))
     for assign in parents_assigns:
       graph[lsi].append(assign)
       in_degree[assign] += 1
