@@ -385,10 +385,10 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   metadata: Dict[UOp, Metadata] = {}
   cache: Dict[LazyBuffer, UOp] = {}
   big_graph = UOp(UOps.SINK, dtypes.void, tuple(to_uop(x, buf_uops, metadata, cache) for x in outs))
-  stores: Dict[UOp, UOp] = {}
-  graph_rewrite(big_graph, append_stores, stores)
   # break the big graph into small graphs
   if (small_graphs:=schedule_cache.get(big_graph)) is None:
+    stores: Dict[UOp, UOp] = {}
+    graph_rewrite(big_graph, append_stores, stores)
     schedule_cache[big_graph] = small_graphs = []
     for outbufs in output_groups.values():
       sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))

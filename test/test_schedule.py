@@ -12,12 +12,12 @@ from tinygrad import nn, dtypes, Device, Tensor
 from tinygrad.dtype import DType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View
-from tinygrad.ops import BinaryOps, MetaOps, UOp, UnaryOps, UOps, graph_rewrite, track_rewrites
-from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, GlobalCounters, flatten, getenv, SPLIT_REDUCEOP, unwrap, prod, Context
+from tinygrad.ops import BinaryOps, MetaOps, PatternMatcher, UOp, UnaryOps, UOps, graph_rewrite, track_rewrites
+from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, GlobalCounters, all_same, flatten, getenv, SPLIT_REDUCEOP, unwrap, prod, Context
 from tinygrad.codegen.kernel import Kernel, verify_ast
-from tinygrad.engine.schedule import BUF_LIMIT, create_schedule, view_right, st_fixup, view_left
+from tinygrad.engine.schedule import BUF_LIMIT, create_schedule, view_right, st_fixup, view_left, append_bufs
 from tinygrad.engine.realize import CompiledRunner, run_schedule
-from tinygrad.engine.lazy import LazyBuffer, view_supported_devices
+from tinygrad.engine.lazy import LazyBuffer, create_lazybuffer, view_supported_devices
 from test.helpers import ast_const, is_dtype_supported, timeit
 from extra.models.llama import precompute_freqs_cis
 
@@ -1794,6 +1794,22 @@ class TestIndexing(unittest.TestCase):
     def rewrite(sink): return graph_rewrite(graph_rewrite(sink, view_left), view_right)
     ret = rewrite(sink)
     assert len([x for x in ret.sparents if x.op is UOps.VIEW and len(x.src) != 0]) == 0, f"unmerged views left in sink {ret}"
+
+  def test_schedule_cache(self):
+    a: LazyBuffer = Tensor([1, 2, 3, 4]).realize().lazydata
+    b: LazyBuffer = Tensor([1, 2, 3, 4]).realize().lazydata
+    alu1 = a+b
+    x1 = create_lazybuffer(alu1.device, ShapeTracker.from_shape(alu1.shape), alu1.dtype, alu1.op, None, tuple(alu1.srcs), enable_cache=False)
+    x2 = create_lazybuffer(alu1.device, ShapeTracker.from_shape(alu1.shape), alu1.dtype, alu1.op, None, tuple(alu1.srcs), enable_cache=False)
+    assert x1 is not x2
+    sched1 = create_schedule([x1])
+    self.assertEqual(len(sched1), 1)
+    backup_rewrite = PatternMatcher.rewrite
+    del PatternMatcher.rewrite
+    sched2 = create_schedule([x2])
+    self.assertEqual(len(sched2), 1)
+    assert sched1[0].ast is sched2[0].ast
+    PatternMatcher.rewrite = backup_rewrite
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)
