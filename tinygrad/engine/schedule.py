@@ -136,12 +136,8 @@ to_ast = PatternMatcher([
   (UPat(UOps.SINK, src=(UPat.store(UPat(), UPat(), UPat(tuple(METAOPS.values()), name="x")),)), lambda x: x),
 ])
 
-def _do_replace(ctx:Tuple[Tuple[UOp, ...], Dict[UOp, Optional[UOp]]], st:UOp, b:UOp, val:UOp) -> UOp:
-  outputs, assign_preloads = ctx
-  if val.op is UOps.ASSIGN: assign_preloads[b] = None
-  return val if b in outputs else UOp(UOps.LOAD, val.dtype, (b, st))
-replace_load_stores = PatternMatcher([
-  (UPat.load(UPat.var("b"), UPat.var("st"), UPat.store(UPat.var("b"), UPat(), UPat.var("val"))), _do_replace),
+fuse_multioutput = PatternMatcher([
+  (UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), arg=False), lambda outputs,b: outputs.get(b, None)),
 ])
 
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
@@ -154,12 +150,16 @@ if getenv("RUN_PROCESS_REPLAY"):
 
 def to_uop(buf:LazyBuffer, buf_uops:Dict[Buffer, UOp], metadata:Dict[UOp, Metadata], cache:Dict[LazyBuffer, UOp]) -> UOp:
   if (r:=cache.get(buf)) is not None: return r
+  # all movementops are UOps.VIEW
   if buf is not buf.base:
     cache[buf] = ret = to_uop(buf.base, buf_uops, metadata, cache).view(buf.st)
     return ret
+  # consts are always fused and generated
   if buf.op is MetaOps.CONST: return buf_uops[buf.buffer]
   dtype = buf.dtype.base if isinstance(buf.dtype, ImageDType) else buf.dtype
-  if buf.is_realized(): return UOp(UOps.LOAD, dtype, (buf_uops[buf.buffer], buf.st.to_uop()))
+  # preloads are always loaded
+  if buf.is_realized(): return UOp(UOps.LOAD, dtype, (buf_uops[buf.buffer], buf.st.to_uop()), buf.is_realized())
+  # otherwise we fuse it or STORE -> LOAD the value in global memory
   src = tuple(to_uop(x, buf_uops, metadata, cache) for x in buf.srcs)
   if buf.op in ReduceOps: ret = src[0].r(buf.op, buf.arg)
   elif buf.op is MetaOps.CONTIGUOUS: ret = UOp(UOps.CONTIGUOUS, dtype, src)
@@ -251,20 +251,11 @@ def _get_isolated_children(r:LazyBuffer, reduce_for_op:Dict[LazyBuffer, LazyBuff
   for tr in group: _recursive_group(tr, tr.st, tr, children, realizes, reduce_for_op, descendants, cache={})
   return merge_dicts([group, {} if any(tr in group for tr in descendants) else descendants])
 
-def _append_store(stores:Dict[UOp, UOp], b:UOp, store:UOp) -> None:
+def _append_store(stores:Dict[UOp, UOp], st:UOp, b:UOp, val:UOp, store:UOp) -> UOp:
   stores[b] = store
-  return None
+  return UOp(UOps.LOAD, val.dtype, (b, st), False)
 append_stores = PatternMatcher([
-  (UPat.load(UPat.var("b"), UPat(), UPat(UOps.STORE, src=(UPat.var("b"), UPat(), UPat()), name="store")), _append_store),
-])
-
-def _append_assign(assign_preloads:Dict[UOp, Optional[UOp]], root:UOp, b:UOp) -> None:
-  if b in assign_preloads:
-    assert assign_preloads[b] is None, f"got multiple preloads for {b} {assign_preloads[b]} {root}"
-    assign_preloads[b] = root
-  return None
-append_preloads = PatternMatcher([
-  (UPat(UOps.LOAD, src=(UPat.var("b"), UPat()), name="root"), _append_assign),
+  (UPat.load(UPat.var("b"), UPat.var("st"), UPat(UOps.STORE, src=(UPat.var("b"), UPat(), UPat.var("val")), name="store")), _append_store),
 ])
 
 @track_rewrites(named=True)
@@ -347,7 +338,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   uop_bufs: Dict[UOp, Buffer] = {}
   var_vals: Dict[Variable, int] = {}
   lazybufs_to_realize: Dict[Buffer, LazyBuffer] = {}
-  assign_preloads: Dict[UOp, Optional[UOp]] = {}
+  assigned_to: Set[UOp] = set()
   for buf in realizes:
     if buf.realized is None and buf.op is not MetaOps.CONST:
       if (dup:=lazybufs_to_realize.get(buf.buffer)) is not None:
@@ -373,23 +364,27 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
       buf_uops[buf.buffer] = uop
       uop_bufs[uop] = buf.buffer
     if buf.realized is None and buf.op is not MetaOps.CONST:
-      if buf.op is MetaOps.ASSIGN: assign_preloads[uop] = None
+      if buf.op is MetaOps.ASSIGN: assigned_to.add(uop)
       output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
 
+  # this is the big graph
   metadata: Dict[UOp, Metadata] = {}
   cache: Dict[LazyBuffer, UOp] = {}
   sink = UOp(UOps.SINK, dtypes.void, tuple(to_uop(x, buf_uops, metadata, cache) for x in outs))
   stores: Dict[UOp, UOp] = {}
   graph_rewrite(sink, append_stores, stores)
-  if len(assign_preloads) != 0: graph_rewrite(sink, append_preloads, assign_preloads)
-  # preschedule all buffers in realizes
+  # break the big graph into ScheduleItems
   prescheduled: List[ScheduleItem] = []
   preloads: List[List[UOp]] = []
   for outbufs in output_groups.values():
     sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
-    sink = graph_rewrite(sink, replace_load_stores, (outputs:=tuple(x.src[0] for x in sink.src), si_preloads:=assign_preloads.copy()))
-    preloads.append([k for k,v in si_preloads.items() if v is not None and k not in outputs and v in sink.sparents])
+    # fuse multi output store -> loads
+    if len(outputs:={x.src[0]:x.src[2] for x in sink.src}) > 1: sink = graph_rewrite(sink, fuse_multioutput, outputs)
+    # add assign preloads
+    preloads.append([b for x in sink.parents if x.op is UOps.LOAD and x.arg and (b:=x.src[0]) in assigned_to and b not in outputs] if len(assigned_to) != 0 else [])
+    # swizzling
     sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
+    # append buffers and var_vals
     bufs: List[UOp] = []
     sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
     prescheduled.append(si:=ScheduleItem(sink, tuple(uop_bufs[b] for b in bufs), ()))
