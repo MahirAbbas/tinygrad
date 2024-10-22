@@ -271,6 +271,7 @@ append_stores = PatternMatcher([
   (UPat.load(UPat.var("b"), UPat.var("st"), UPat(UOps.STORE, src=(UPat.var("b"), UPat(), UPat.var("val")), name="store")), _append_store),
 ])
 
+schedule_cache: Dict[UOp, Tuple[Tuple[UOp, ...], Tuple[Tuple[int, ...], ...]]] = {}
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:
   """create a graph for realizing the outputs"""
@@ -383,9 +384,9 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   # this is the big graph
   metadata: Dict[UOp, Metadata] = {}
   cache: Dict[LazyBuffer, UOp] = {}
-  sink = UOp(UOps.SINK, dtypes.void, tuple(to_uop(x, buf_uops, metadata, cache) for x in outs))
+  big_graph = UOp(UOps.SINK, dtypes.void, tuple(to_uop(x, buf_uops, metadata, cache) for x in outs))
   stores: Dict[UOp, UOp] = {}
-  graph_rewrite(sink, append_stores, stores)
+  graph_rewrite(big_graph, append_stores, stores)
   # break the big graph into ScheduleItems
   prescheduled: List[ScheduleItem] = []
   assign_preloads: List[List[UOp]] = []
