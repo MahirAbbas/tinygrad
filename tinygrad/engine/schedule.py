@@ -368,8 +368,9 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
     if buf.buffer not in buf_uops:
       buf_uops[buf.buffer] = uop
       uop_bufs[uop] = buf.buffer
-    if buf.realized is None and buf.op is not MetaOps.CONST: output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
-    if buf.op is MetaOps.ASSIGN: assign_preloads[uop] = None
+    if buf.realized is None and buf.op is not MetaOps.CONST:
+      if buf.op is MetaOps.ASSIGN: assign_preloads[uop] = None
+      output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
 
   metadata: Dict[UOp, Metadata] = {}
   cache: Dict[LazyBuffer, UOp] = {}
@@ -382,8 +383,8 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   preloads: List[List[UOp]] = []
   for outbufs in output_groups.values():
     sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
-    sink = graph_rewrite(sink, replace_load_stores, (tuple(x.src[0] for x in sink.src), si_preloads:=assign_preloads.copy()))
-    preloads.append([k for k,v in si_preloads.items() if v is not None and v in sink.sparents])
+    sink = graph_rewrite(sink, replace_load_stores, (outputs:=tuple(x.src[0] for x in sink.src), si_preloads:=assign_preloads.copy()))
+    preloads.append([k for k,v in si_preloads.items() if v is not None and k not in outputs and v in sink.sparents])
     sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
     bufs: List[UOp] = []
     sink = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
@@ -395,7 +396,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   for i,lsi in enumerate(prescheduled):
     if lsi not in in_degree: in_degree[lsi] = 0
     # realize outputs before a parent is assigned to
-    parents_assigns = dedup(schedule_targets[uop_bufs[x]] for x in preloads[i])
+    parents_assigns = dedup(xsi for x in preloads[i] if (xsi:=schedule_targets.get(uop_bufs[x])))
     for assign in parents_assigns:
       graph[lsi].append(assign)
       in_degree[assign] += 1
@@ -404,6 +405,8 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
     for x in scheduled_parents:
       graph[x].append(lsi)
       in_degree[lsi] += 1
+  if len(assign_preloads) != 0 and all(len(x) == 0 for x in preloads):
+    raise RuntimeError(f"cycle detected in ASSIGN schedule for {list(assign_preloads)} buffers.")
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
