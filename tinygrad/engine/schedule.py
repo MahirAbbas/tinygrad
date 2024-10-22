@@ -125,7 +125,7 @@ view_right = merge_views+PatternMatcher([
   (UPat(UOps.REDUCE_AXIS, src=(UPat(UOps.REDUCE_AXIS, name="first_reduce"),), name="root"), merge_double_reduce),
 ])
 
-def _append_st_vars(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], Tuple[int, ...]], x:UOp) -> Optional[UOp]:
+def _append_st_vars(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], List[UOp]], x:UOp) -> Optional[UOp]:
   if (st:=unwrap(x.st)) in ctx[1]: return None
   st, var_vals = st.simplify().unbind()
   ctx[0].update(var_vals)
@@ -133,8 +133,9 @@ def _append_st_vars(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], Tuple[int,
   return st.to_uop() if st != x.st else None
 append_st_vars = PatternMatcher([(UPat(UOps.VIEW, name="x"), _append_st_vars)])
 
-def _append_buf(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], Tuple[int, ...]], x:UOp) -> UOp:
-  return UOp(UOps.DEFINE_GLOBAL, x.dtype, (), ctx[2].index(x.arg[0]))
+def _append_buf(ctx:Tuple[Dict[Variable, int], Set[ShapeTracker], List[UOp]], x:UOp) -> UOp:
+  ctx[2].append(x)
+  return UOp(UOps.DEFINE_GLOBAL, x.dtype, (), len(ctx[2])-1)
 append_bufs = PatternMatcher([(UPat(UOps.BUFFER, name="x"), _append_buf),])
 
 to_ast = PatternMatcher([
@@ -142,17 +143,17 @@ to_ast = PatternMatcher([
   (UPat(UOps.SINK, src=(UPat.store(UPat(), UPat(), UPat(tuple(METAOPS.values()), name="x")),)), lambda x: x),
 ])
 
-PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, Tuple[int, ...], UOp]] = []
-def full_ast_rewrite(base_sink:UOp, bufs:Tuple[int, ...], var_vals:Dict[Variable, int]) -> UOp:
+PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, UOp]] = []
+def full_ast_rewrite(base_sink:UOp, bufs:List[UOp], var_vals:Dict[Variable, int]) -> UOp:
   sink = graph_rewrite(graph_rewrite(base_sink, view_left), view_right)
   ret = graph_rewrite(graph_rewrite(sink, to_ast), append_st_vars+append_bufs, (var_vals, set(), bufs))
-  PROCESS_REPLAY_CAPTURE.append((base_sink, bufs, ret))
+  PROCESS_REPLAY_CAPTURE.append((base_sink, ret))
   return ret
 
 if getenv("RUN_PROCESS_REPLAY"):
   @atexit.register
   def save_process_replay():
-    for base_sink,ctx,ret in PROCESS_REPLAY_CAPTURE: diskcache_put("schedule_process_replay", str(base_sink.key), (base_sink, ctx, ret))
+    for base_sink,ret in PROCESS_REPLAY_CAPTURE: diskcache_put("schedule_process_replay", str(base_sink.key), (base_sink, ret))
 
 # *** List[LazyBuffer] lowering to ScheduleItem ***
 
@@ -186,14 +187,16 @@ def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], var_val
   metadata: Dict[UOp, Metadata] = {}
   sink = UOp(UOps.SINK, src=tuple(UOp.store(buf_uops[out.buffer], ShapeTracker.from_shape(out.shape).to_uop(),
                                             to_uop(out, outs, inputs, buf_uops, metadata, cache)) for out in outs))
-  sink = full_ast_rewrite(sink, tuple(buf_uops[x.buffer].arg[0] for x in outs+inputs), var_vals)
+  bufs: List[UOp] = []
+  sink = full_ast_rewrite(sink, bufs, var_vals)
   # we also allow masked views. if it has a single view and it's equal when you shrink a contig, it's fine
   if len(assign_targets:=[x.src[0] for x in sink.sparents if x.op is UOps.ASSIGN]) != 0:
     if not all((s:=x.st_arg).contiguous or (len(s.views) == 1 and (m:=s.views[0].mask) is not None \
         and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in sink.sparents if x.op is UOps.LOAD and x.src[0] in assign_targets):
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
-  return LBScheduleItem(sink, tuple(outs+inputs), tuple(dedup(metadata.values())))
+  lazybufs = tuple(x for _,x in sorted([(bufs.index(buf_uops[x.buffer]), x) for x in outs+inputs], key=lambda x:x[0]))
+  return LBScheduleItem(sink, lazybufs, tuple(dedup(metadata.values())))
 
 # *** DAG creation: decide which LazyBuffers should realize ***
 
