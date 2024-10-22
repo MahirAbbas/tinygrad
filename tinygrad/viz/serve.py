@@ -103,7 +103,8 @@ class Handler(BaseHTTPRequestHandler):
       self.end_headers()
       query = parse_qs(url.query)
       if (qkernel:=query.get("kernel")) is not None:
-        g = get_details(*kernels[int(qkernel[0])][int(query["idx"][0])])
+        data = kernels[int(qkernel[0])][int(query["idx"][0])]
+        g = get_details(*data)
         ret = json.dumps({**asdict(g), "graphs": list(map(uop_to_json, g.graphs)), "uops": list(map(str, g.graphs))}).encode()
       else: ret = json.dumps([list(map(lambda x:asdict(x[2]), v)) for v in kernels]).encode()
     else:

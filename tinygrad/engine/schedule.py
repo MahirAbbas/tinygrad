@@ -178,6 +178,27 @@ def to_uop(buf:LazyBuffer, outputs:List[LazyBuffer], inputs:List[LazyBuffer], bu
   if buf.metadata is not None: metadata[ret] = buf.metadata
   return ret
 
+def to_big_uop(buf:LazyBuffer, buf_uops:Dict[Buffer, UOp], metadata:Dict[UOp, Metadata], cache:Dict[LazyBuffer, UOp]) -> UOp:
+  if (r:=cache.get(buf)) is not None: return r
+  if buf is not buf.base:
+    cache[buf] = ret = to_big_uop(buf.base, buf_uops, metadata, cache).view(buf.st)
+    return ret
+  if buf.op is MetaOps.CONST: return buf_uops[buf.buffer]
+  dtype = buf.dtype.base if isinstance(buf.dtype, ImageDType) else buf.dtype
+  if buf.is_realized(): return UOp(UOps.LOAD, dtype, (buf_uops[buf.buffer], buf.st.to_uop()))
+  src = tuple(to_big_uop(x, buf_uops, metadata, cache) for x in buf.srcs)
+  if buf.op in ReduceOps: ret = src[0].r(buf.op, buf.arg)
+  elif buf.op is MetaOps.CONTIGUOUS: ret = UOp(UOps.CONTIGUOUS, dtype, src)
+  elif buf.op is MetaOps.ASSIGN: ret = UOp(UOps.ASSIGN, dtype, (buf_uops[buf.buffer], src[1]), buf.arg)
+  elif buf.op in METAOPS: ret = UOp(METAOPS[cast(MetaOps, buf.op)], buf.dtype, (buf_uops[buf.buffer], *src), buf.arg)
+  elif buf.op is UnaryOps.CAST: ret = UOp(UOps.CAST, dtype, src)
+  elif buf.op is UnaryOps.BITCAST: ret = UOp(UOps.BITCAST, dtype, src)
+  else: ret = UOp(UOps.ALU, dtype, src, buf.op)
+  cache[buf] = ret = ret if (ubuf:=buf_uops.get(buf.buffer)) is None else \
+      UOp(UOps.LOAD, dtype, (ubuf, buf.st.to_uop(), UOp.store(ubuf, ShapeTracker.from_shape(buf.shape).to_uop(), ret)))
+  if buf.metadata is not None: metadata[ret] = buf.metadata
+  return ret
+
 def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], var_vals:Dict[Variable, int]) -> LBScheduleItem:
   """describe the computation for a LazyBuffer with UOp + inputs + var_vals"""
   cache: Dict[LazyBuffer, UOp] = {}
@@ -271,6 +292,13 @@ def _get_isolated_children(r:LazyBuffer, reduce_for_op:Dict[LazyBuffer, LazyBuff
   descendants: Dict[LazyBuffer, None] = {}
   for tr in group: _recursive_group(tr, tr.st, tr, children, realizes, reduce_for_op, descendants, cache={})
   return merge_dicts([group, {} if any(tr in group for tr in descendants) else descendants])
+
+def _append_store(stores:Dict[UOp, UOp], st:UOp, b:UOp, val:UOp, store:UOp) -> UOp:
+  stores[b] = store
+  return UOp(UOps.LOAD, val.dtype, (b, st))
+append_stores = PatternMatcher([
+  (UPat.load(UPat.var("b"), UPat.var("st"), UPat(UOps.STORE, src=(UPat.var("b"), UPat(), UPat.var("val")), name="store")), _append_store),
+])
 
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:
@@ -377,6 +405,13 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
       buf_uops[buf.buffer] = uop
       uop_bufs[uop] = buf.buffer
     if buf.realized is None and buf.op is not MetaOps.CONST: output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
+
+  metadata: Dict[UOp, Metadata] = {}
+  cache: Dict[LazyBuffer, UOp] = {}
+  sink = UOp(UOps.SINK, dtypes.void, tuple(to_big_uop(x, buf_uops, metadata, cache) for x in outs))
+  stores: Dict[UOp, UOp] = {}
+  graph_rewrite(sink, append_stores, stores)
+  for outbufs in output_groups.values(): sink = UOp(UOps.SINK, dtypes.void, tuple(stores[b] for b in outbufs))
 
   # preschedule all buffers in realizes
   prescheduled = [_lower_lazybuffer([lazybufs_to_realize[uop_bufs[b]] for b in outs], buf_uops, var_vals) for outs in output_groups.values()]
