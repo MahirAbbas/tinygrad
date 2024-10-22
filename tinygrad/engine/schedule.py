@@ -26,13 +26,17 @@ class ScheduleItem:
   bufs: Tuple[Buffer, ...]
   metadata: Tuple[Metadata, ...]
   @property
+  def mutable_idxs(self) -> Tuple[int, ...]:
+    """Writable buffer idxs"""
+    return tuple(x.src[0].arg for x in (self.ast.src if self.ast.op is UOps.SINK else (self.ast,)))
+  @property
   def outputs(self) -> Tuple[Buffer, ...]:
     """Read/write or write only buffers in the schedule."""
-    return self.bufs[:len(self.ast.src)] if self.ast.op is UOps.SINK else self.bufs[0:1]
+    return tuple(b for i,b in enumerate(self.bufs) if i in self.mutable_idxs)
   @property
   def inputs(self) -> Tuple[Buffer, ...]:
     """Read only buffers in the schedule."""
-    return self.bufs[len(self.ast.src):] if self.ast.op is UOps.SINK else self.bufs[1:]
+    return tuple(b for i,b in enumerate(self.bufs) if i not in self.mutable_idxs)
 
 # *** UOp with VIEW (movementops) rewriting to UOp we can index ***
 
@@ -405,8 +409,6 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
     for x in scheduled_parents:
       graph[x].append(lsi)
       in_degree[lsi] += 1
-  if len(assign_preloads) != 0 and all(len(x) == 0 for x in preloads):
-    raise RuntimeError(f"cycle detected in ASSIGN schedule for {list(assign_preloads)} buffers.")
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
