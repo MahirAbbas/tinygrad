@@ -36,17 +36,6 @@ class ScheduleItem:
   @functools.cached_property
   def output_idxs(self) -> Tuple[int, ...]: return tuple(x.src[0].arg for x in self.ast.src) if self.ast.op is UOps.SINK else (0,)
 
-@dataclass(frozen=True)
-class LBScheduleItem:
-  ast: UOp
-  bufs: Tuple[LazyBuffer, ...]
-  ubufs: Tuple[UOp, ...]
-  metadata: Tuple[Metadata, ...]
-  @property
-  def outputs(self) -> Tuple[LazyBuffer, ...]: return self.bufs[:len(self.ast.src)] if self.ast.op is UOps.SINK else self.bufs[0:1]
-  @property
-  def inputs(self) -> Tuple[LazyBuffer, ...]: return self.bufs[len(self.ast.src):] if self.ast.op is UOps.SINK else self.bufs[1:]
-
 # *** UOp with VIEW (movementops) rewriting to UOp we can index ***
 
 # ** helpers for doing movementops on uops
@@ -191,7 +180,7 @@ def to_uop(buf:LazyBuffer, outputs:List[LazyBuffer], inputs:List[LazyBuffer], bu
   if buf.metadata is not None: metadata[ret] = buf.metadata
   return ret
 
-def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], var_vals:Dict[Variable, int]) -> LBScheduleItem:
+def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], uop_bufs:Dict[UOp, Buffer], var_vals:Dict[Variable, int]) -> ScheduleItem:
   """describe the computation for a LazyBuffer with UOp + inputs + var_vals"""
   cache: Dict[LazyBuffer, UOp] = {}
   inputs: List[LazyBuffer] = []
@@ -205,7 +194,7 @@ def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], var_val
         and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in sink.sparents if x.op is UOps.LOAD and x.src[0] in assign_targets):
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
-  return LBScheduleItem(sink, tuple(outs+inputs), tuple(ctx.bufs), tuple(dedup(metadata.values())))
+  return ScheduleItem(sink, tuple(b for u in ctx.bufs if (b:=uop_bufs[u]).size != 0), tuple(dedup(metadata.values())))
 
 # *** DAG creation: decide which LazyBuffers should realize ***
 
@@ -398,11 +387,11 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
       if buf.op is not MetaOps.CONST:output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
 
   # preschedule all buffers in realizes
-  prescheduled = [_lower_lazybuffer([lazybufs_to_realize[uop_bufs[b]] for b in outs], buf_uops, var_vals) for outs in output_groups.values()]
+  prescheduled = [_lower_lazybuffer([lazybufs_to_realize[uop_bufs[b]] for b in outs], buf_uops, uop_bufs,var_vals) for outs in output_groups.values()]
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
 
-  graph: DefaultDict[LBScheduleItem, List[LBScheduleItem]] = defaultdict(list)
-  in_degree: DefaultDict[LBScheduleItem, int] = defaultdict(int)
+  graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
+  in_degree: DefaultDict[ScheduleItem, int] = defaultdict(int)
   for lsi in prescheduled:
     if lsi not in in_degree: in_degree[lsi] = 0
     # realize outputs after all parents are realized
@@ -410,22 +399,23 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
     for x in scheduled_parents:
       graph[x].append(lsi)
       in_degree[lsi] += 1
+    """
     # realize outputs before a parent is assigned to
     parents_assigns = dedup(schedule_targets[assign_targets[x]] for x in lsi.inputs if x in assign_targets)
     for assign in parents_assigns:
       graph[lsi].append(assign)
       in_degree[assign] += 1
+    """
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
   while queue:
-    lsi = queue.popleft()
-    schedule.append(si:=ScheduleItem(lsi.ast, tuple(b for u in lsi.ubufs if (b:=uop_bufs[u]).size != 0), lsi.metadata))
+    schedule.append(si:=queue.popleft())
     for b in si.outputs: del lazybufs_to_realize[b].srcs  # can only schedule once
     if (m:=BUF_LIMIT.get(device:=si.outputs[0].device)) and len(si.bufs) >= m:
       if DEBUG >= 3: print(si)
       raise RuntimeError(f"Kernel for {si.metadata} exceeded the {m} buffer count limit for {device} with {len(si.bufs)} buffers.")
-    for x in graph[lsi]:
+    for x in graph[si]:
       in_degree[x] -= 1
       if in_degree[x] == 0: queue.append(x)
 
