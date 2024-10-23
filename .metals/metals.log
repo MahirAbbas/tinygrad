@@ -1,0 +1,6 @@
+2024.03.20 14:56:35 INFO  Started: Metals version 1.1.0 in folders '/home/mahir/fun/git/tinygrad' for client VSCodium 1.87.2.
+2024.03.20 14:56:36 WARN  Build server is not auto-connectable.
+2024.03.20 14:56:36 WARN  no build tool detected in workspace '/home/mahir/fun/git/tinygrad'. The most common cause for this problem is that the editor was opened in the wrong working directory, for example if you use sbt then the workspace directory should contain build.sbt. 
+2024.03.20 14:56:43 INFO  Shutting down server
+2024.03.20 14:56:43 INFO  shutting down Metals
+2024.03.20 14:56:43 INFO  Exiting server
