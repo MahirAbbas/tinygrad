@@ -25,6 +25,7 @@ class ScheduleItem:
   ast: UOp
   bufs: Tuple[Buffer, ...]
   metadata: Tuple[Metadata, ...]
+  assign_preloads: Tuple[UOp, ...]
   @property
   def outputs(self) -> Tuple[Buffer, ...]:
     """Read/write or write only buffers in the schedule."""
@@ -123,6 +124,8 @@ class ScheduleItemContext:
   var_vals: Dict[Variable, int]
   sts: Set[ShapeTracker]
   bufs: List[UOp]
+  assigned_to: Dict[UOp, None]
+  assign_preloads: List[UOp]
 
 def _append_st_vars(ctx:ScheduleItemContext, x:UOp) -> Optional[UOp]:
   if (st:=unwrap(x.st)) in ctx.sts: return None
@@ -134,11 +137,15 @@ def _append_st_vars(ctx:ScheduleItemContext, x:UOp) -> Optional[UOp]:
 def _append_buf(ctx:ScheduleItemContext, x:UOp) -> UOp:
   ctx.bufs.append(x)
   return UOp(UOps.DEFINE_GLOBAL, x.dtype, (), len(ctx.bufs)-1)
+append_bufs = PatternMatcher([(UPat(UOps.BUFFER, name="x"), _append_buf)])
+
+def _append_preload(ctx:ScheduleItemContext, x:UOp, b:UOp) -> UOp:
+  if b in ctx.assigned_to: ctx.assign_preloads.append(b)
+  return x.replace(op=UOps.LOAD)
 
 to_si = PatternMatcher([
-  (UPat(UOps.BUFFER, name="x"), _append_buf),
   (UPat(UOps.VIEW, name="x"), _append_st_vars),
-  (UPat(UOps.PRELOAD, name="x"), lambda _,x: x.replace(op=UOps.LOAD)),
+  (UPat(UOps.PRELOAD, src=(UPat.var("b"), UPat()), name="x"), _append_preload),
   (UPat(UOps.CONTIGUOUS, src=(UPat.var("x"),)), lambda _,x: x),
   (UPat(UOps.SINK, src=(UPat.store(UPat(), UPat(), UPat(tuple(METAOPS.values()), name="x")),)), lambda _,x: x),
 ])
@@ -146,7 +153,7 @@ to_si = PatternMatcher([
 PROCESS_REPLAY_CAPTURE: List[Tuple[UOp, ScheduleItemContext, UOp]] = []
 def full_ast_rewrite(base_sink:UOp, ctx:ScheduleItemContext) -> UOp:
   sink = graph_rewrite(graph_rewrite(base_sink, view_left), view_right)
-  ret = graph_rewrite(sink, to_si, ctx)
+  ret = graph_rewrite(graph_rewrite(sink, to_si, ctx), append_bufs, ctx)
   PROCESS_REPLAY_CAPTURE.append((base_sink, ctx, ret))
   return ret
 
@@ -180,21 +187,22 @@ def to_uop(buf:LazyBuffer, outputs:List[LazyBuffer], inputs:List[LazyBuffer], bu
   if buf.metadata is not None: metadata[ret] = buf.metadata
   return ret
 
-def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], uop_bufs:Dict[UOp, Buffer], var_vals:Dict[Variable, int]) -> ScheduleItem:
+def _lower_lazybuffer(outs:List[LazyBuffer], buf_uops:Dict[Buffer, UOp], uop_bufs:Dict[UOp, Buffer],
+                      assigned_to: Dict[UOp, None], var_vals:Dict[Variable, int]) -> ScheduleItem:
   """describe the computation for a LazyBuffer with UOp + inputs + var_vals"""
   cache: Dict[LazyBuffer, UOp] = {}
   inputs: List[LazyBuffer] = []
   metadata: Dict[UOp, Metadata] = {}
   sink = UOp(UOps.SINK, src=tuple(UOp.store(buf_uops[out.buffer], ShapeTracker.from_shape(out.shape).to_uop(),
                                             to_uop(out, outs, inputs, buf_uops, metadata, cache)) for out in outs))
-  sink = full_ast_rewrite(sink, ctx:=ScheduleItemContext(var_vals, set(), []))
+  sink = full_ast_rewrite(sink, ctx:=ScheduleItemContext(var_vals, set(), [], assigned_to, []))
   # we also allow masked views. if it has a single view and it's equal when you shrink a contig, it's fine
   if len(assign_targets:=[x.src[0] for x in sink.sparents if x.op is UOps.ASSIGN]) != 0:
     if not all((s:=x.st_arg).contiguous or (len(s.views) == 1 and (m:=s.views[0].mask) is not None \
         and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in sink.sparents if x.op is UOps.LOAD and x.src[0] in assign_targets):
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
-  return ScheduleItem(sink, tuple(b for u in ctx.bufs if (b:=uop_bufs[u]).size != 0), tuple(dedup(metadata.values())))
+  return ScheduleItem(sink, tuple(b for u in ctx.bufs if (b:=uop_bufs[u]).size != 0), tuple(dedup(metadata.values())), tuple(ctx.assign_preloads))
 
 # *** DAG creation: decide which LazyBuffers should realize ***
 
@@ -356,7 +364,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   buf_uops: Dict[Buffer, UOp] = {}
   uop_bufs: Dict[UOp, Buffer] = {}
   var_vals: Dict[Variable, int] = {}
-  assign_targets: Dict[LazyBuffer, LazyBuffer] = {}
+  assigned_to: Dict[UOp, None] = {}
   lazybufs_to_realize: Dict[Buffer, LazyBuffer] = {}
   for buf in realizes:
     if buf.realized is None and buf.op is not MetaOps.CONST:
@@ -383,29 +391,28 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
       buf_uops[buf.buffer] = uop
       uop_bufs[uop] = buf.buffer
     if buf.realized is None:
-      if buf.op is MetaOps.ASSIGN: assign_targets[buf.srcs[0]] = buf
+      if buf.op is MetaOps.ASSIGN: assigned_to[buf_uops[buf.buffer]] = None
       if buf.op is not MetaOps.CONST:output_groups[reduce_for_op.get(buf, buf)].append(buf_uops[buf.buffer])
 
   # preschedule all buffers in realizes
-  prescheduled = [_lower_lazybuffer([lazybufs_to_realize[uop_bufs[b]] for b in outs], buf_uops, uop_bufs,var_vals) for outs in output_groups.values()]
+  prescheduled = [_lower_lazybuffer([lazybufs_to_realize[uop_bufs[b]] for b in outs], buf_uops, uop_bufs,
+                                    assigned_to, var_vals) for outs in output_groups.values()]
   schedule_targets = {out:lsi for lsi in prescheduled for out in lsi.outputs}
 
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
   in_degree: DefaultDict[ScheduleItem, int] = defaultdict(int)
   for lsi in prescheduled:
     if lsi not in in_degree: in_degree[lsi] = 0
-    # realize outputs after all parents are realized
-    scheduled_parents = dedup(schedule_targets[x] for x in lsi.inputs if x in schedule_targets)
-    for x in scheduled_parents:
-      graph[x].append(lsi)
-      in_degree[lsi] += 1
-    """
     # realize outputs before a parent is assigned to
-    parents_assigns = dedup(schedule_targets[assign_targets[x]] for x in lsi.inputs if x in assign_targets)
+    parents_assigns = dedup(xsi for x in lsi.assign_preloads if (xsi:=schedule_targets.get(uop_bufs[x])) and xsi is not lsi)
     for assign in parents_assigns:
       graph[lsi].append(assign)
       in_degree[assign] += 1
-    """
+    # realize outputs after all parents are realized
+    scheduled_parents = dedup(xsi for x in lsi.inputs if (xsi:=schedule_targets.get(x)) is not None and xsi not in parents_assigns)
+    for x in scheduled_parents:
+      graph[x].append(lsi)
+      in_degree[lsi] += 1
 
   queue = deque(lsi for lsi,deg in in_degree.items() if deg == 0)
   schedule: List[ScheduleItem] = []
